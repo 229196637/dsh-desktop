@@ -1,0 +1,119 @@
+name: Build Windows NEXT
+
+# Builds the DSH NEXT Windows installer (NSIS) and portable zip from master,
+# publishes a rolling "next" prerelease. Download the Setup.exe from
+# https://github.com/229196637/dsh-desktop/releases/tag/next and run it to
+# upgrade in place (user data in %USERPROFILE%\.dsh is preserved).
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - '**/*.md'
+      - 'dsh-bundles/**'
+      - '.github/ISSUE_TEMPLATE/**'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-windows-next
+  cancel-in-progress: true
+
+env:
+  YARN_CACHE_FOLDER: ${{ github.workspace }}/.yarn-cache
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+
+jobs:
+  build:
+    name: DSH NEXT win-x64
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute build version
+        id: ver
+        shell: pwsh
+        run: |
+          $pkg = Get-Content dsh-desktop-next/package.json -Raw | ConvertFrom-Json
+          $ver = "$($pkg.version).$($env:GITHUB_RUN_NUMBER)"
+          if ($ver -notmatch '^\d+\.\d+\.\d+-next\.\d+$') { throw "unexpected version: $ver" }
+          "next=$ver" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "Building DSH NEXT $ver from commit $($env:GITHUB_SHA)"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Cache yarn, electron and runtime downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            .yarn-cache
+            .cache/electron
+            dsh-desktop-next/.desktop-build/downloads
+          key: win-next-${{ hashFiles('yarn.lock') }}
+          restore-keys: win-next-
+
+      - name: Enable Yarn 4 via Corepack
+        shell: pwsh
+        run: |
+          corepack enable
+          corepack prepare yarn@4.18.0 --activate
+          $yv = (yarn --version)
+          if ($yv -notlike '4.*') { npm install -g yarn@4.18.0; $yv = (yarn --version) }
+          if ($yv -notlike '4.*') { throw "yarn 4 not available, got '$yv'" }
+          Write-Host "yarn $yv on node $(node --version)"
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Download Electron binary
+        run: node dsh-desktop-next/node_modules/electron/install.js
+        env:
+          ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
+
+      - name: Package Windows installer (NSIS)
+        run: yarn dist:win:next
+        env:
+          DSH_NEXT_BUILD_VERSION: ${{ steps.ver.outputs.next }}
+
+      - name: Package Windows portable zip
+        run: yarn workspace dsh-desktop-next dist:win-portable
+        env:
+          DSH_NEXT_BUILD_VERSION: ${{ steps.ver.outputs.next }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-next-win-x64-${{ steps.ver.outputs.next }}
+          path: |
+            dsh-desktop-next/dist/*.exe
+            dsh-desktop-next/dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: "Publish rolling prerelease (tag: next)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_VER: ${{ steps.ver.outputs.next }}
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem dsh-desktop-next/dist -File |
+            Where-Object { $_.Name -match '^DSH-NEXT-.*\.(exe|zip)$' } |
+            ForEach-Object { $_.FullName }
+          if (-not $files) { throw "no installer artifacts found in dsh-desktop-next/dist" }
+          $files | ForEach-Object { Write-Host "release asset: $_" }
+          gh release view next 2>$null
+          if ($LASTEXITCODE -eq 0) { gh release delete next --yes --cleanup-tag }
+          $notes = @(
+            "Commit: $($env:GITHUB_SHA.Substring(0, 8)) on master",
+            "",
+            "- ``DSH-NEXT-$($env:BUILD_VER)-x64-Setup.exe`` — 安装版：直接运行即可覆盖升级，用户数据（%USERPROFILE%\.dsh）保留",
+            "- ``DSH-NEXT-$($env:BUILD_VER)-x64-Portable.zip`` — 便携版：解压即用",
+            "",
+            "注意：安装包未做代码签名，首次运行 SmartScreen 可能提示，选择「仍要运行」即可。"
+          ) -join "`n"
+          gh release create next $files --prerelease --title "DSH NEXT ${{ steps.ver.outputs.next }}" --notes $notes
